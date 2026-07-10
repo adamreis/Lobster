@@ -377,8 +377,13 @@ kill_orphaned_mcp_processes() {
         # Skip systemd-managed services — they are independently lifecycle-managed,
         # not orphans. Killing them causes a restart race where Claude initializes
         # before the MCP server comes back up, leaving the session without MCP tools.
-        if systemctl status --pid "$pid" >/dev/null 2>&1; then
-            log "CLEANUP: MCP PID $pid is a systemd-managed service — skipping"
+        # Use cgroup membership to detect systemd services — `systemctl status --pid`
+        # is unreliable on some systemd versions and may return non-zero even for
+        # managed processes (causing false-positive kills and MCP startup races).
+        local pid_cgroup
+        pid_cgroup=$(cat "/proc/$pid/cgroup" 2>/dev/null || true)
+        if echo "$pid_cgroup" | grep -qE "lobster-mcp|lobster\.mcp"; then
+            log "CLEANUP: MCP PID $pid is systemd-managed (cgroup: $pid_cgroup) — skipping"
             skipped=$((skipped + 1))
             continue
         fi
@@ -644,7 +649,7 @@ with open('$tmp_state', 'w') as f:
         write_state "restarting" "exit_code=$exit_code"
 
         # Detect auth failures from session log
-        if tail -5 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
+        if tail -5 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -q "authentication_error\|OAuth token has expired\|API usage limits\|Failed to authenticate. API Error: 401"; then
             AUTH_FAIL_COUNT=$((AUTH_FAIL_COUNT + 1))
             if [[ $AUTH_FAIL_COUNT -ge 3 ]] && [[ "$AUTH_FAIL_ALERTED" != "true" ]]; then
                 AUTH_FAIL_ALERTED=true
