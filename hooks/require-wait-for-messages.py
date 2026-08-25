@@ -183,6 +183,33 @@ def _collect_tool_names(transcript: list) -> list[str]:
     return names
 
 
+
+def _bash_wfm_called(transcript: list) -> bool:
+    """Check if any Bash tool_use in transcript invoked wait_for_messages (HTTP fallback).
+
+    When native MCP tools fail to load due to the SSE timing race at session
+    start, the dispatcher calls wait_for_messages via a Bash tool that POSTs
+    to the HTTP MCP endpoint. Recognise that pattern as equivalent to a native
+    mcp__lobster-inbox__wait_for_messages call.
+    """
+    for entry in transcript:
+        if not isinstance(entry, dict):
+            continue
+        nested_msg = entry.get("message")
+        if isinstance(nested_msg, dict):
+            content = nested_msg.get("content", [])
+        else:
+            content = entry.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                if item.get("name") == "Bash":
+                    cmd = item.get("input", {}).get("command", "")
+                    if "wait_for_messages" in cmd:
+                        return True
+    return False
+
 def main() -> None:
     # Only run for sessions started by Lobster (LOBSTER_MAIN_SESSION=1).
     # This guards against firing in a developer's personal Claude Code session.
@@ -218,6 +245,11 @@ def main() -> None:
     tool_names = _collect_tool_names(transcript)
 
     if _WFM_TOOL in tool_names:
+        _exit_ok()
+
+    # HTTP fallback: Bash calls invoking wait_for_messages via the MCP HTTP
+    # endpoint are accepted when native MCP tools failed to load (SSE race).
+    if _bash_wfm_called(transcript):
         _exit_ok()
 
     # wait_for_messages was not called. Check for the graceful exit bypass before
