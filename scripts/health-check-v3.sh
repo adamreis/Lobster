@@ -90,8 +90,11 @@ INBOX_DIR="$MESSAGES_DIR/inbox"
 MAINTENANCE_FLAG="$MESSAGES_DIR/config/lobster-maintenance"
 LOBSTER_STATE_FILE="${LOBSTER_STATE_FILE_OVERRIDE:-$MESSAGES_DIR/config/lobster-state.json}"
 DISPATCHER_PID_FILE="$MESSAGES_DIR/config/dispatcher.pid"
-STALE_THRESHOLD_SECONDS=240          # 4 minutes - RED if any message older (watchdog handles soft recovery at 90s)
-YELLOW_THRESHOLD_SECONDS=150         # 2.5 minutes - YELLOW warning
+STALE_THRESHOLD_SECONDS=900          # 15 min - RED if any message older. RAISED from 240 on 2026-08-25: the
+                                     # local-qwen backend takes 20-290s/turn vs 33-38s on Anthropic, so 240s
+                                     # fired on 15%% of NORMAL turns. 900 = LiteLLM router ceiling; past it no
+                                     # legitimate request can still be in flight.
+YELLOW_THRESHOLD_SECONDS=450         # 7.5 min - YELLOW warning (was 150; scaled with the threshold above)
 RESTART_WINDOW_BUFFER_SECONDS=120    # Pre-mark messages within this window of the stale threshold before a restart
 
 MAINTENANCE_EXPIRY_SECONDS=3600      # 1 hour - stale maintenance flag is auto-cleared and checks resume
@@ -99,9 +102,12 @@ MAINTENANCE_EXPIRY_SECONDS=3600      # 1 hour - stale maintenance flag is auto-c
 COMPACTION_SUPPRESS_SECONDS=300      # 5 minutes - skip stale-inbox check after a compaction event
 COMPACT_GRACE_SECONDS=900            # 15 minutes - skip stale-inbox check after a compaction (last-compact.ts)
 # CATCHUP_SUPPRESS_SECONDS removed (issue #1483): dispatcher heartbeat threshold covers catchup naturally
-RESTART_COOLDOWN_SUPPRESS_SECONDS=240 # 4 minutes - suppress stale-inbox RED after a recent restart
+RESTART_COOLDOWN_SUPPRESS_SECONDS=900 # 15 min - suppress stale-inbox RED after a recent restart (was 240)
 
-BOOT_GRACE_SECONDS=90                # 90s - skip stale-inbox, WFM, and process checks after a restart
+BOOT_GRACE_SECONDS=420               # 7 min - skip stale-inbox, WFM, process checks after a restart.
+                                     # RAISED from 90 on 2026-08-25: dispatcher boot MEASURED at ~353s, so a
+                                     # 90s grace let checks fire against a still-booting dispatcher and restart
+                                     # it again — that was the 5-restarts-in-40-min loop on 2026-08-25.
 
 HIBERNATE_FRESH_SECONDS=30           # DEPRECATED — kept for reference; hibernate state is no longer written by dispatcher
 
@@ -1345,6 +1351,55 @@ except:
         # Could not parse output — treat as transient and log a warning
         log_warn "AUTH YELLOW: could not parse 'claude auth status' output — treating as transient"
         return 1
+    fi
+
+    # Check expiresAt even when loggedIn=true — the field can be true with an
+    # expired token, which caused a 152-restart burst in June 2026.
+    # If the token expires within 10 minutes (600s) or is already expired,
+    # treat as auth failure and trigger re-authentication alert.
+    local expires_secs_remaining
+    expires_secs_remaining=$(echo "$auth_json" | uv run python3 -c "
+import json, sys, datetime, time
+try:
+    d = json.load(sys.stdin)
+    expires_at = d.get('expiresAt')
+    if not expires_at:
+        print('none')
+    else:
+        # expiresAt may be milliseconds (>1e12) or seconds
+        ts = float(expires_at)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        remaining = ts - time.time()
+        print(int(remaining))
+except Exception as e:
+    print('none')
+" 2>/dev/null)
+
+    if [[ "$expires_secs_remaining" != "none" ]] && [[ "$expires_secs_remaining" =~ ^-?[0-9]+$ ]]; then
+        if [[ $expires_secs_remaining -le 600 ]]; then
+            # Token expired or expiring within 10 minutes — treat as auth failure
+            local failure_count=0
+            if [[ -f "$AUTH_FAILURE_COUNTER_FILE" ]]; then
+                failure_count=$(cat "$AUTH_FAILURE_COUNTER_FILE" 2>/dev/null || echo 0)
+            fi
+            failure_count=$((failure_count + 1))
+            echo "$failure_count" > "$AUTH_FAILURE_COUNTER_FILE"
+            if [[ $expires_secs_remaining -le 0 ]]; then
+                log_error "AUTH RED: token expired (expiresAt=${expires_secs_remaining}s ago, loggedIn=true was misleading) — consecutive: $failure_count/$AUTH_CONSECUTIVE_RED_THRESHOLD"
+            else
+                log_error "AUTH RED: token expiring in ${expires_secs_remaining}s (<10min, loggedIn=true was misleading) — consecutive: $failure_count/$AUTH_CONSECUTIVE_RED_THRESHOLD"
+            fi
+            if [[ $failure_count -ge $AUTH_CONSECUTIVE_RED_THRESHOLD ]]; then
+                rm -f "$AUTH_FAILURE_COUNTER_FILE"
+                return 2
+            else
+                return 1
+            fi
+        else
+            local expires_mins=$(( expires_secs_remaining / 60 ))
+            log_info "AUTH OK: loggedIn=true via $auth_method, token expires in ~${expires_mins}min"
+        fi
     fi
 
     # Logged in — reset failure counter and report GREEN.
